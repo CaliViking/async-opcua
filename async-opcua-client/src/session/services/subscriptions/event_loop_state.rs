@@ -72,15 +72,20 @@ impl<T: Future<Output = Result<bool, Error>>, R: Fn() -> T, S: SubscriptionCache
         trigger_publish_recv: tokio::sync::watch::Receiver<Instant>,
         publish_limits_rx: Receiver<PublishLimits>,
         publish_source: R,
-        subscription_cache: S,
+        mut subscription_cache: S,
     ) -> Self {
         let last_external_trigger = *trigger_publish_recv.borrow();
+        // A trigger sent before this point is not seen as new, and a reconnect
+        // transfers or recreates its subscriptions, sending its trigger, before
+        // the loop is built. So the loop starts publishing when subscriptions
+        // already exist, rather than waiting for a trigger that already fired.
+        let no_active_subscription = subscription_cache.next_publish_time(false).is_none();
         Self {
             last_external_trigger,
             trigger_publish_recv,
             futures: FuturesUnordered::new(),
             waiting_for_response: false,
-            no_active_subscription: true,
+            no_active_subscription,
             publish_limits_rx,
             publish_source,
             subscription_cache,
@@ -229,5 +234,59 @@ impl<T: Future<Output = Result<bool, Error>>, R: Fn() -> T, S: SubscriptionCache
                 }
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+    use std::time::{Duration, Instant};
+
+    use opcua_types::Error;
+
+    use super::{SubscriptionCache, SubscriptionEventLoopState};
+    use crate::{session::services::subscriptions::PublishLimits, SubscriptionActivity};
+
+    /// A cache holding one subscription, whose next publish is due now.
+    struct OneSubscription;
+
+    impl SubscriptionCache for OneSubscription {
+        fn next_publish_time(&mut self, _set_last_publish: bool) -> Option<Instant> {
+            Some(Instant::now())
+        }
+    }
+
+    /// A reconnect transfers or recreates the session's subscriptions, and
+    /// sends its publish trigger, before the session event loop builds the new
+    /// subscription event loop. The new loop must still publish.
+    #[tokio::test]
+    async fn a_loop_built_after_its_subscriptions_exist_publishes_without_a_new_trigger() {
+        let (trigger_tx, trigger_rx) = tokio::sync::watch::channel(Instant::now());
+        trigger_tx
+            .send(Instant::now())
+            .expect("the trigger is sent");
+        let mut limits = PublishLimits::new();
+        limits.update_subscriptions(1, Duration::from_millis(10));
+        let (_limits_tx, limits_rx) = tokio::sync::watch::channel(limits);
+        let published = Arc::new(AtomicUsize::new(0));
+        let counter = published.clone();
+        let mut state = SubscriptionEventLoopState::new(
+            1,
+            trigger_rx,
+            limits_rx,
+            move || {
+                counter.fetch_add(1, Ordering::SeqCst);
+                std::future::ready(Ok::<bool, Error>(false))
+            },
+            OneSubscription,
+        );
+        let activity = tokio::time::timeout(Duration::from_secs(2), state.iter_loop())
+            .await
+            .expect("the loop sends a publish request");
+        assert!(matches!(activity, SubscriptionActivity::Publish));
+        assert!(published.load(Ordering::SeqCst) >= 1);
     }
 }
