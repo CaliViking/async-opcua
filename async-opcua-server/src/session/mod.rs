@@ -4,4 +4,5 @@ pub(crate) mod instance;
 pub(crate) mod manager;
 #[macro_use]
 pub(crate) mod message_handler;
+pub(crate) mod refusal_report;
 mod services;

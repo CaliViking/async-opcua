@@ -42,6 +42,11 @@ pub struct Limits {
     /// Maximum number of registered sessions before new ones are rejected.
     #[serde(default = "defaults::max_sessions")]
     pub max_sessions: usize,
+    /// Shortest time in milliseconds between two reports of refused
+    /// CreateSession and ActivateSession requests. Refusals in between are
+    /// only counted. Must be greater than zero.
+    #[serde(default = "defaults::refusal_report_interval_ms")]
+    pub refusal_report_interval_ms: u64,
 }
 
 impl Default for Limits {
@@ -60,6 +65,7 @@ impl Default for Limits {
             max_query_continuation_points: defaults::max_query_continuation_points(),
             operational: OperationalLimits::default(),
             max_sessions: defaults::max_sessions(),
+            refusal_report_interval_ms: defaults::refusal_report_interval_ms(),
         }
     }
 }
@@ -243,6 +249,9 @@ mod defaults {
     pub(super) fn max_sessions() -> usize {
         constants::MAX_SESSIONS
     }
+    pub(super) fn refusal_report_interval_ms() -> u64 {
+        constants::REFUSAL_REPORT_INTERVAL_MS
+    }
 
     pub(super) fn max_subscriptions_per_session() -> usize {
         constants::MAX_SUBSCRIPTIONS_PER_SESSION
@@ -364,6 +373,7 @@ mod tests {
                 max_history_continuation_points: 500,
                 max_query_continuation_points: 500,
                 max_sessions: 20,
+                refusal_report_interval_ms: 60_000,
                 subscriptions: SubscriptionLimits {
                     max_subscriptions_per_session: 100,
                     max_pending_publish_requests: 20,
@@ -399,5 +409,27 @@ mod tests {
                 },
             }
         );
+    }
+
+    #[test]
+    fn refusal_report_interval_defaults_to_sixty_seconds() {
+        let omitted: Limits = serde_yaml::from_str("{}").unwrap();
+        assert_eq!(omitted.refusal_report_interval_ms, 60_000);
+        assert_eq!(Limits::default().refusal_report_interval_ms, 60_000);
+    }
+
+    #[test]
+    fn server_config_refuses_a_zero_refusal_report_interval() {
+        use crate::config::ServerConfig;
+        use opcua_core::config::Config;
+
+        let refusal = "Server configuration is invalid. Refusal report interval is invalid";
+        let mut config = ServerConfig::default();
+        let errors = config.validate().unwrap_err();
+        assert!(!errors.iter().any(|e| e == refusal), "{errors:?}");
+
+        config.limits.refusal_report_interval_ms = 0;
+        let errors = config.validate().unwrap_err();
+        assert!(errors.iter().any(|e| e == refusal), "{errors:?}");
     }
 }

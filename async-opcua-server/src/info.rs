@@ -464,10 +464,9 @@ impl ServerInfo {
                         )
                     })?
                 } else {
-                    error!("Identity token password is encrypted but no server private key was supplied");
                     return Err(Error::new(
                         StatusCode::BadIdentityTokenInvalid,
-                        "Failed to decrypt identity token password",
+                        "Failed to decrypt identity token password, it is encrypted but no server private key was supplied",
                     ));
                 }
             } else {
@@ -495,13 +494,11 @@ impl ServerInfo {
         server_nonce: &ByteString,
     ) -> Result<UserToken, Error> {
         if !self.authenticator.supports_x509(endpoint) {
-            error!("Endpoint doesn't support x509 tokens");
             Err(Error::new(
                 StatusCode::BadIdentityTokenRejected,
                 "Endpoint doesn't support x509 tokens",
             ))
         } else if token.policy_id.as_ref() != POLICY_ID_X509 {
-            error!("Token doesn't possess the correct policy id");
             Err(Error::new(
                 StatusCode::BadIdentityTokenRejected,
                 "Token doesn't possess the correct policy id",
@@ -578,10 +575,9 @@ impl ServerInfo {
                 if let Some(ref server_key) = server_key {
                     legacy_decrypt_secret(token, server_nonce.as_ref(), server_key)?
                 } else {
-                    error!("Identity token password is encrypted but no server private key was supplied");
                     return Err(Error::new(
                         StatusCode::BadIdentityTokenInvalid,
-                        "Failed to decrypt identity token issued token",
+                        "Failed to decrypt identity token issued token, it is encrypted but no server private key was supplied",
                     ));
                 }
             } else {

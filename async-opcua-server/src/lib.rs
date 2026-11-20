@@ -126,6 +126,9 @@ pub mod constants {
 
     /// Maximum number of sessions active on a server.
     pub const MAX_SESSIONS: usize = 20;
+    /// Shortest time in milliseconds between two reports of refused
+    /// session-establishment requests.
+    pub const REFUSAL_REPORT_INTERVAL_MS: u64 = 60_000;
     /// Maximum number of references per node during Browse or BrowseNext.
     pub const MAX_REFERENCES_PER_BROWSE_NODE: usize = 1000;
 

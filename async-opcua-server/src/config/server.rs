@@ -326,6 +326,11 @@ impl Config for ServerConfig {
                 "Server configuration is invalid. Max byte string length is invalid".to_owned(),
             );
         }
+        if self.limits.refusal_report_interval_ms == 0 {
+            errors.push(
+                "Server configuration is invalid. Refusal report interval is invalid".to_owned(),
+            );
+        }
         if self.discovery_urls.is_empty() {
             errors.push("Server configuration is invalid. Discovery urls not set".to_owned());
         }
