@@ -11,7 +11,7 @@ use opcua_core::{comms::secure_channel::SecureChannel, trace_read_lock, trace_wr
 use opcua_crypto::{random, CertificateStore, SecurityPolicy};
 use parking_lot::RwLock;
 use tokio::sync::Notify;
-use tracing::{error, info};
+use tracing::{debug, error, info};
 
 use crate::{identity_token::IdentityToken, info::ServerInfo};
 use opcua_types::{
@@ -20,7 +20,11 @@ use opcua_types::{
     StatusCode,
 };
 
-use super::{instance::Session, message_handler::MessageHandler};
+use super::{
+    instance::Session,
+    message_handler::MessageHandler,
+    refusal_report::{EstablishmentService, RefusalReport},
+};
 
 static NEXT_SESSION_ID: AtomicU32 = AtomicU32::new(1);
 
@@ -35,6 +39,7 @@ pub struct SessionManager {
     sessions: HashMap<NodeId, Arc<RwLock<Session>>>,
     info: Arc<ServerInfo>,
     notify: Arc<Notify>,
+    refusals: RefusalReport,
 }
 
 impl SessionManager {
@@ -43,6 +48,7 @@ impl SessionManager {
             sessions: Default::default(),
             info,
             notify,
+            refusals: RefusalReport::default(),
         }
     }
 
@@ -61,29 +67,71 @@ impl SessionManager {
             .map(|p| p.1.clone())
     }
 
+    /// Count a refused session-establishment request in the refusal report,
+    /// and return the status code the client is answered with.
+    fn refused(&self, service: EstablishmentService, err: Error) -> StatusCode {
+        debug!("{} refused: {err}", service.name());
+        let status = err.status();
+        self.refusals.record(service, status);
+        status
+    }
+
     pub(crate) fn create_session(
         &mut self,
         channel: &mut SecureChannel,
         certificate_store: &RwLock<CertificateStore>,
         request: &CreateSessionRequest,
     ) -> Result<CreateSessionResponse, StatusCode> {
-        if self.sessions.len() >= self.info.config.limits.max_sessions {
-            return Err(StatusCode::BadTooManySessions);
+        self.create_session_inner(channel, certificate_store, request)
+            .map_err(|err| self.refused(EstablishmentService::CreateSession, err))
+    }
+
+    fn create_session_inner(
+        &mut self,
+        channel: &mut SecureChannel,
+        certificate_store: &RwLock<CertificateStore>,
+        request: &CreateSessionRequest,
+    ) -> Result<CreateSessionResponse, Error> {
+        let max_sessions = self.info.config.limits.max_sessions;
+        if self.sessions.len() >= max_sessions {
+            return Err(Error::new(
+                StatusCode::BadTooManySessions,
+                format!("Create session refused, the server already holds its limit of {max_sessions} sessions"),
+            ));
         }
 
         // TODO: Auditing and diagnostics.
+        if request.endpoint_url.is_empty() {
+            return Err(Error::new(
+                StatusCode::BadTcpEndpointUrlInvalid,
+                "Create session was passed a null endpoint url",
+            ));
+        }
+        // Endpoint matching writes an error line for a url it cannot parse, so
+        // such a url is refused before it reaches the matching.
+        if let Err(err) = url::Url::parse(request.endpoint_url.as_ref()) {
+            return Err(Error::new(
+                StatusCode::BadTcpEndpointUrlInvalid,
+                format!(
+                    "Create session was passed endpoint url {}, which cannot be parsed: {err}",
+                    request.endpoint_url
+                ),
+            ));
+        }
+
+        // TODO request.endpoint_url should match hostname of server application certificate
+        // Find matching end points for this url
         let endpoints = self
             .info
             .new_endpoint_descriptions(request.endpoint_url.as_ref());
-        // TODO request.endpoint_url should match hostname of server application certificate
-        // Find matching end points for this url
-        if request.endpoint_url.is_empty() {
-            error!("Create session was passed an null endpoint url");
-            return Err(StatusCode::BadTcpEndpointUrlInvalid);
-        }
-
         let Some(endpoints) = endpoints else {
-            return Err(StatusCode::BadTcpEndpointUrlInvalid);
+            return Err(Error::new(
+                StatusCode::BadTcpEndpointUrlInvalid,
+                format!(
+                    "Create session was passed endpoint url {}, which matches no endpoint",
+                    request.endpoint_url
+                ),
+            ));
         };
 
         let security_policy = channel.security_policy();
@@ -91,10 +139,14 @@ impl SessionManager {
         if !matches!(security_policy, SecurityPolicy::None)
             && request.client_nonce.len() < self.info.config.session_nonce_length
         {
-            error!("Create session was passed a client nonce that is too short, expected at least {} bytes, got {}", 
-                self.info.config.session_nonce_length, request.client_nonce.len()
-            );
-            return Err(StatusCode::BadNonceInvalid);
+            return Err(Error::new(
+                StatusCode::BadNonceInvalid,
+                format!(
+                    "Create session was passed a client nonce that is too short, expected at least {} bytes, got {}",
+                    self.info.config.session_nonce_length,
+                    request.client_nonce.len()
+                ),
+            ));
         }
 
         let client_certificate = if security_policy != SecurityPolicy::None {
@@ -306,6 +358,21 @@ pub(crate) async fn activate_session(
     request: &ActivateSessionRequest,
     handler: &mut MessageHandler,
 ) -> Result<ActivateSessionResponse, StatusCode> {
+    match activate_session_inner(mgr_lck, channel, request, handler).await {
+        Ok(response) => Ok(response),
+        Err(err) => {
+            let mgr = trace_read_lock!(mgr_lck);
+            Err(mgr.refused(EstablishmentService::ActivateSession, err))
+        }
+    }
+}
+
+async fn activate_session_inner(
+    mgr_lck: &RwLock<SessionManager>,
+    channel: &mut SecureChannel,
+    request: &ActivateSessionRequest,
+    handler: &mut MessageHandler,
+) -> Result<ActivateSessionResponse, Error> {
     let security_policy = channel.security_policy();
     let security_mode = channel.security_mode();
     let secure_channel_id = channel.secure_channel_id();
@@ -314,12 +381,17 @@ pub(crate) async fn activate_session(
         let mgr = trace_read_lock!(mgr_lck);
         let Some(session_lck) = mgr.find_by_token(&request.request_header.authentication_token)
         else {
-            return Err(StatusCode::BadSessionIdInvalid);
+            return Err(Error::new(
+                StatusCode::BadSessionIdInvalid,
+                "Activate session was passed an authentication token that matches no session",
+            ));
         };
 
         let (endpoint_url, session_nonce) = {
             let session = trace_read_lock!(session_lck);
-            session.validate_timed_out()?;
+            session.validate_timed_out().map_err(|status| {
+                Error::new(status, "Activate session was passed a timed-out session")
+            })?;
 
             let endpoint_url = session.endpoint_url().to_string();
 
@@ -327,9 +399,12 @@ pub(crate) async fn activate_session(
                 .info
                 .endpoint_exists(&endpoint_url, security_policy, security_mode)
             {
-                error!("activate_session, Endpoint dues not exist for requested url & mode {}, {:?} / {:?}",
-                endpoint_url, security_policy, security_mode);
-                return Err(StatusCode::BadTcpEndpointUrlInvalid);
+                return Err(Error::new(
+                    StatusCode::BadTcpEndpointUrlInvalid,
+                    format!(
+                        "Activate session found no endpoint for the session's url and mode {endpoint_url}, {security_policy:?} / {security_mode:?}"
+                    ),
+                ));
             }
 
             if security_policy != SecurityPolicy::None {
@@ -360,8 +435,14 @@ pub(crate) async fn activate_session(
         let mut session = trace_write_lock!(session_lck);
 
         if !session.is_activated() && session.secure_channel_id() != secure_channel_id {
-            error!("activate session, rejected secure channel id {} for inactive session does not match one used to create session, {}", secure_channel_id, session.secure_channel_id());
-            return Err(StatusCode::BadSecureChannelIdInvalid);
+            return Err(Error::new(
+                StatusCode::BadSecureChannelIdInvalid,
+                format!(
+                    "Activate session rejected secure channel id {} for an inactive session, which was created on secure channel id {}",
+                    secure_channel_id,
+                    session.secure_channel_id()
+                ),
+            ));
         } else {
             // TODO additional secure channel validation here for client certificate and user identity
             //  token
